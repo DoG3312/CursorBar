@@ -36,8 +36,8 @@ pip install -r requirements.txt
 python CursorBar.py
 ```
 
-Готовую сборку можно скачать в разделе Releases — папку нужно перенести целиком,
-`CursorBar.exe` без `_internal` не запустится.
+Готовую сборку можно сделать самостоятельно — см. раздел «Сборка .exe». Папку нужно
+переносить целиком, `CursorBar.exe` без `_internal` не запустится.
 
 ## Сборка .exe
 
