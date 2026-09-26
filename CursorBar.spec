@@ -5,7 +5,7 @@ a = Analysis(
     ['CursorBar.py'],
     pathex=[],
     binaries=[],
-    datas=[('CursorBar.svg', '.')],
+    datas=[('CursorBar.svg', '.'), ('CursorBar.ico', '.')],
     hiddenimports=['keyboard', 'pyperclip'],
     hookspath=[],
     hooksconfig={},

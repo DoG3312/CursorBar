@@ -6,6 +6,12 @@ import random
 import ctypes
 
 try:
+    import winreg
+except ImportError:
+    # Автозапуск есть только в Windows, но остальной код должен работать и без него
+    winreg = None
+
+try:
     import keyboard
     import pyperclip
 except ImportError as error:
@@ -14,7 +20,8 @@ except ImportError as error:
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QListWidget, QListWidgetItem, QLineEdit, QLabel,
     QPushButton, QHBoxLayout, QVBoxLayout, QMessageBox, QAbstractItemView, QComboBox,
-    QToolButton, QDialog, QDialogButtonBox, QFrame, QSizePolicy,
+    QToolButton, QDialog, QDialogButtonBox, QFrame, QSizePolicy, QCheckBox,
+    QSystemTrayIcon, QMenu,
 )
 from PyQt6.QtCore import (
     Qt, QRectF, QPointF, QPoint, QObject, QTimer, pyqtSignal, QPropertyAnimation, pyqtProperty,
@@ -72,10 +79,14 @@ BUNDLE_DIR = _bundle_dir()
 EMOJIS_PATH = os.path.join(APP_DIR, "emojis.json")
 SETTINGS_PATH = os.path.join(APP_DIR, "settings.json")
 BACKGROUND_PATH = os.path.join(APP_DIR, "background.png")
-# Иконку ищем сначала рядом с программой (свою), затем среди встроенных ресурсов
+# Иконку ищем сначала рядом с программой (свою), затем среди встроенных ресурсов.
+# ICO идёт следом за SVG на случай, если в сборке не оказалось плагина Qt для SVG:
+# без него иконка молча получилась бы пустой и значок в трее был бы невидимым
 ICON_CANDIDATES = (
     os.path.join(APP_DIR, "CursorBar.svg"),
     os.path.join(BUNDLE_DIR, "CursorBar.svg"),
+    os.path.join(APP_DIR, "CursorBar.ico"),
+    os.path.join(BUNDLE_DIR, "CursorBar.ico"),
 )
 
 DEFAULT_STYLE = "classic"
@@ -116,21 +127,43 @@ def style_names():
     return list(STYLES.keys())
 
 
+def read_json_file(path):
+    """Читает JSON. Возвращает (данные, ошибка).
+
+    Используем utf-8-sig: некоторые редакторы сохраняют файлы с BOM, а json.load
+    на BOM падает — из-за этого настройки выглядели бы сломанными и стирались.
+    """
+    for encoding in ("utf-8-sig", "utf-16"):
+        try:
+            with open(path, encoding=encoding) as file:
+                return json.load(file), None
+        except FileNotFoundError:
+            return None, None  # Файла нет — это не ошибка, просто пусто
+        except UnicodeDecodeError:
+            continue  # Не эта кодировка — пробуем следующую
+        except (json.JSONDecodeError, OSError) as error:
+            return None, str(error)
+    return None, "не удалось определить кодировку файла"
+
+
 def load_settings(path=SETTINGS_PATH):
-    """Читает настройки. При отсутствии или поломке файла берёт значения по умолчанию."""
-    settings = {"style": DEFAULT_STYLE}
-    try:
-        with open(path, encoding="utf-8") as file:
-            data = json.load(file)
-    except FileNotFoundError:
-        return settings
-    except (json.JSONDecodeError, OSError) as error:
+    """Читает настройки. При отсутствии или поломке файла берёт значения по умолчанию.
+
+    Незнакомые ключи сохраняем: их пишут другие части программы, и терять их нельзя.
+    """
+    settings = {"style": DEFAULT_STYLE, "tray_hint_shown": False}
+    data, error = read_json_file(path)
+    if error:
         print(f"Не удалось прочитать {path} ({error}). Использую настройки по умолчанию.")
+        return settings
+    if data is None:
         return settings
 
     if not isinstance(data, dict):
         print(f"Файл {path} должен содержать объект настроек. Использую значения по умолчанию.")
         return settings
+
+    settings.update(data)
 
     # Неизвестный стиль (например, файл правили вручную) не должен ломать меню
     style = data.get("style")
@@ -138,17 +171,133 @@ def load_settings(path=SETTINGS_PATH):
         settings["style"] = style
     elif style is not None:
         print(f"Неизвестный стиль {style!r} в {path}. Использую «{DEFAULT_STYLE}».")
+        settings["style"] = DEFAULT_STYLE
     return settings
 
 
 def save_settings(settings, path=SETTINGS_PATH):
-    """Сохраняет настройки. Возвращает текст ошибки или None при успехе."""
+    """Сохраняет настройки целиком. Возвращает текст ошибки или None при успехе."""
     try:
         with open(path, "w", encoding="utf-8") as file:
             json.dump(settings, file, ensure_ascii=False, indent=2)
         return None
     except OSError as error:
         return str(error)
+
+
+def update_settings(updates, path=SETTINGS_PATH):
+    """Дописывает настройки, не теряя остальные ключи.
+
+    Записывать файл целиком нельзя: в нём могут быть и другие настройки,
+    и они пропадали бы при каждом сохранении вида колеса.
+    """
+    loaded, error = read_json_file(path)
+    if error:
+        print(f"Не удалось прочитать {path} ({error}). Записываю только новые ключи.")
+    data = loaded if isinstance(loaded, dict) else {}
+    data.update(updates)
+    return save_settings(data, path)
+
+
+def reset_setting(key, path=SETTINGS_PATH):
+    """Убирает ключ из настроек: при следующем чтении вернётся значение по умолчанию."""
+    loaded, error = read_json_file(path)
+    if error or not isinstance(loaded, dict):
+        return
+    if key in loaded:
+        del loaded[key]
+        save_settings(loaded, path)
+
+
+def hide_close_button(widget):
+    """Убирает крестик из заголовка окна (только Windows).
+
+    Qt-флаг WindowCloseButtonHint на Windows крестик не убирает: проверено —
+    стиль окна не меняется, зона крестика остаётся на месте. Windows рисует
+    крестик по биту WS_SYSMENU, который Qt не снимает, поэтому делаем это сами.
+    """
+    if os.name != "nt":
+        return
+    GWL_STYLE = -16
+    WS_SYSMENU = 0x00080000
+    SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER = 0x0020, 0x0002, 0x0001, 0x0004
+    try:
+        user32 = ctypes.windll.user32
+        hwnd = int(widget.winId())
+        style = user32.GetWindowLongW(hwnd, GWL_STYLE)
+        if not style & WS_SYSMENU:
+            return  # Крестика уже нет — второй раз стиль не трогаем
+        user32.SetWindowLongW(hwnd, GWL_STYLE, style & ~WS_SYSMENU)
+        # Без SetWindowPos рамка не перерисуется и крестик останется на экране
+        user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0,
+                            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER)
+    except (AttributeError, OSError):
+        # Не получилось — окно просто останется с крестиком, это не критично
+        pass
+
+
+# Автозапуск держим в пользовательской ветке реестра: прав администратора не нужно
+AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+AUTOSTART_NAME = "CursorBar"
+
+
+def autostart_supported():
+    """Автозапуск возможен только в Windows."""
+    return winreg is not None and os.name == "nt"
+
+
+def autostart_command():
+    """Команда, которую Windows выполнит при входе в систему.
+
+    Для собранного .exe это он сам. Для запуска из исходников берём pythonw.exe:
+    обычный python.exe открывал бы пустое чёрное окно консоли при каждом входе.
+    """
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}"'
+    script = os.path.abspath(__file__)
+    interpreter = sys.executable
+    if interpreter.lower().endswith("python.exe"):
+        windowed = interpreter[:-len("python.exe")] + "pythonw.exe"
+        if os.path.exists(windowed):
+            interpreter = windowed
+    return f'"{interpreter}" "{script}"'
+
+
+def autostart_enabled():
+    """Включён ли автозапуск сейчас. Сравниваем команду: путь мог переехать."""
+    if not autostart_supported():
+        return False
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_KEY) as key:
+            value, _ = winreg.QueryValueEx(key, AUTOSTART_NAME)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+    return value == autostart_command()
+
+
+def set_autostart(enabled):
+    """Включает или выключает автозапуск. Возвращает текст ошибки или None."""
+    if not autostart_supported():
+        return "Автозапуск поддерживается только в Windows."
+
+    try:
+        # Ключ создаём на случай, если его нет: без него OpenKey упадёт
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, AUTOSTART_KEY, 0,
+                                winreg.KEY_SET_VALUE) as key:
+            if enabled:
+                winreg.SetValueEx(key, AUTOSTART_NAME, 0, winreg.REG_SZ,
+                                  autostart_command())
+            else:
+                try:
+                    winreg.DeleteValue(key, AUTOSTART_NAME)
+                except FileNotFoundError:
+                    # Записи и так нет — цель уже достигнута
+                    pass
+    except OSError as error:
+        return str(error)
+    return None
 
 
 def clean_emoji(text):
@@ -158,13 +307,11 @@ def clean_emoji(text):
 
 def load_emojis(path=EMOJIS_PATH):
     """Читает список смайликов из JSON. При отсутствии или поломке файла берёт стандартный набор."""
-    try:
-        with open(path, encoding="utf-8") as file:
-            data = json.load(file)
-    except FileNotFoundError:
-        return list(DEFAULT_EMOJIS)
-    except (json.JSONDecodeError, OSError) as error:
+    data, error = read_json_file(path)
+    if error:
         print(f"Не удалось прочитать {path} ({error}). Использую стандартный набор.")
+        return list(DEFAULT_EMOJIS)
+    if data is None:
         return list(DEFAULT_EMOJIS)
 
     if not isinstance(data, list):
@@ -191,8 +338,29 @@ def save_emojis(emojis, path=EMOJIS_PATH):
 APP_ICON = None
 
 
+def icon_draws_anything(icon):
+    """Рисует ли иконка хоть что-то.
+
+    QIcon.isNull() недостаточно: если в сборке нет плагина для SVG, QIcon
+    создаётся успешно, но пустой, и значок в трее получается невидимым.
+    Поэтому проверяем реальные пиксели.
+    """
+    if icon is None or icon.isNull():
+        return False
+    for size in (16, 32):
+        pixmap = icon.pixmap(size, size)
+        if pixmap.isNull() or pixmap.width() == 0:
+            continue
+        image = pixmap.toImage()
+        for y in range(image.height()):
+            for x in range(image.width()):
+                if image.pixelColor(x, y).alpha() > 20:
+                    return True
+    return False
+
+
 def load_app_icon(path=None):
-    """Иконка приложения из SVG. Возвращает None, если файла нет или он повреждён."""
+    """Иконка приложения. Возвращает None, если ни один файл не дал картинку."""
     global APP_ICON
     if APP_ICON is not None:
         return APP_ICON
@@ -202,8 +370,10 @@ def load_app_icon(path=None):
         if not os.path.exists(candidate):
             continue
         icon = QIcon(candidate)
-        if icon.isNull():
-            print(f"Не удалось прочитать иконку {candidate}. Работаю без неё.")
+        if not icon_draws_anything(icon):
+            # Сюда попадаем и когда файл битый, и когда в сборке нет плагина
+            # нужного формата — поэтому просто пробуем следующий кандидат
+            print(f"Иконка {candidate} пустая (нет плагина формата?). Пробую следующую.")
             continue
         APP_ICON = icon
         return APP_ICON
@@ -455,18 +625,20 @@ class EmojiEditor(QWidget):
     """Окно редактирования списка смайликов."""
 
     saved = pyqtSignal(list)
-    exit_requested = pyqtSignal()
     style_changed = pyqtSignal(str)
 
     def __init__(self, emojis, style=DEFAULT_STYLE):
         super().__init__()
         self.setWindowTitle("Смайлики меню")
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        # Крестик в заголовке убираем: его легко нажать, желая просто свернуть окно,
+        # а окно закрывалось и выходило из приложения целиком. Закрыть редактор
+        # можно Esc или кнопкой «Сохранить», выйти из программы — значком в трее
+        self.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
         icon = load_app_icon()
         if icon is not None:
             self.setWindowIcon(icon)
         self.resize(420, 560)
-
         self.list_widget = EmojiList()
         # Двойной клик по строке позволяет поправить смайлик прямо в списке
         self.list_widget.setEditTriggers(
@@ -545,16 +717,23 @@ class EmojiEditor(QWidget):
         info_button = QPushButton("Справка")
         info_button.setToolTip("Подсказки по работе с редактором")
         info_button.clicked.connect(self.show_help)
-        # Короткая подпись: длинная распирала бы ширину окна
-        exit_button = QPushButton("Выход")
-        exit_button.setToolTip("Закрыть меню смайликов полностью")
-        exit_button.clicked.connect(self.request_exit)
+
+        # Автозапуск применяем сразу при переключении: отдельной кнопки «применить» нет
+        self.autostart_box = QCheckBox("Запускать вместе с Windows")
+        self.autostart_box.setToolTip(
+            "Приложение будет стартовать автоматически при входе в систему.\n"
+            "Снять галочку — убрать из автозапуска.")
+        if autostart_supported():
+            self.autostart_box.setChecked(autostart_enabled())
+            self.autostart_box.toggled.connect(self._on_autostart_toggled)
+        else:
+            self.autostart_box.setEnabled(False)
+            self.autostart_box.setToolTip("Доступно только в Windows.")
 
         bottom_row = QHBoxLayout()
         bottom_row.addWidget(save_button)
         bottom_row.addStretch(1)
         bottom_row.addWidget(info_button)
-        bottom_row.addWidget(exit_button)
 
         # Разделители отделяют список от настроек и кнопок
         self.divider_top = QFrame()
@@ -570,6 +749,7 @@ class EmojiEditor(QWidget):
         layout.addWidget(self.divider_top)
         layout.addLayout(input_row)
         layout.addLayout(style_row)
+        layout.addWidget(self.autostart_box)
         layout.addWidget(self.divider_bottom)
         layout.addLayout(bottom_row)
 
@@ -651,12 +831,24 @@ class EmojiEditor(QWidget):
             "<b>background.png</b> рядом со скриптом.</li>"
             "<li>Смайлики хранятся в <b>emojis.json</b>, вид колеса — в "
             "<b>settings.json</b> рядом со скриптом.</li>"
+            "<li><b>Запускать вместе с Windows</b> — приложение будет само "
+            "стартовать при входе в систему. Снимите галочку, чтобы убрать.</li>"
             "</ul>"
             "<b>Горячие клавиши</b>"
             "<ul>"
             "<li><b>Ctrl+Shift+E</b> — открыть меню.</li>"
             "<li><b>Ctrl+Shift+R</b> — открыть этот редактор.</li>"
-            "<li><b>Esc</b> или правая кнопка мыши — закрыть меню.</li>"
+            "<li><b>Esc</b> — закрыть редактор или меню.</li>"
+            "<li>Правая кнопка мыши — закрыть меню.</li>"
+            "</ul>"
+            "<b>Значок в трее</b>"
+            "<ul>"
+            "<li>Приложение живёт рядом с часами. Нажмите на значок "
+            "<b>правой кнопкой</b> — откроется меню: меню смайликов, "
+            "этот редактор и <b>выход из программы</b>.</li>"
+            "<li>Двойной клик по значку — открыть меню смайликов.</li>"
+            "<li>Если значка не видно, нажмите стрелку <b>^</b> слева от часов: "
+            "Windows прячет туда редко используемые значки.</li>"
             "</ul>"
         )
         text.setWordWrap(True)
@@ -705,6 +897,16 @@ class EmojiEditor(QWidget):
             event.accept()
         else:
             event.ignore()
+
+    def _on_autostart_toggled(self, enabled):
+        """Включает или выключает автозапуск вслед за галочкой."""
+        error = set_autostart(enabled)
+        if error:
+            QMessageBox.warning(self, "Автозапуск", f"Не удалось изменить: {error}")
+            # Возвращаем галочку к настоящему состоянию, чтобы она не врала
+            self.autostart_box.blockSignals(True)
+            self.autostart_box.setChecked(autostart_enabled())
+            self.autostart_box.blockSignals(False)
 
     def current_emojis(self):
         emojis = []
@@ -787,7 +989,8 @@ class EmojiEditor(QWidget):
             QMessageBox.critical(self, "Не удалось сохранить", error)
             return False
 
-        error = save_settings({"style": self.current_style()})
+        # Дописываем вид, а не пишем файл заново: иначе терялись бы прочие настройки
+        error = update_settings({"style": self.current_style()})
         if error:
             QMessageBox.critical(self, "Не удалось сохранить вид", error)
             return False
@@ -809,37 +1012,6 @@ class EmojiEditor(QWidget):
         return (self.current_emojis() != self._saved_emojis
                 or self.current_style() != self._saved_style)
 
-    def request_exit(self):
-        """Спрашивает подтверждение и завершает программу."""
-        # Несохранённые правки предлагаем записать, иначе они потеряются
-        if self.has_unsaved_changes():
-            answer = QMessageBox.question(
-                self,
-                "Выйти из программы?",
-                "В списке есть несохранённые изменения. Сохранить их перед выходом?",
-                QMessageBox.StandardButton.Save |
-                QMessageBox.StandardButton.Discard |
-                QMessageBox.StandardButton.Cancel,
-                QMessageBox.StandardButton.Save,
-            )
-            if answer == QMessageBox.StandardButton.Save:
-                if not self.save():
-                    # Сохранить не удалось — не выходим, чтобы не потерять правки
-                    return
-            elif answer != QMessageBox.StandardButton.Discard:
-                # Отмена, закрытие диалога или любой другой ответ — остаёмся в программе
-                return
-        elif QMessageBox.question(
-            self,
-            "Выйти из программы?",
-            "Закрыть меню смайликов?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        ) != QMessageBox.StandardButton.Yes:
-            return
-
-        self.exit_requested.emit()
-
     def show_editor(self, emojis, style=DEFAULT_STYLE):
         self.set_emojis(emojis)
         self._saved_emojis = list(emojis)
@@ -851,7 +1023,15 @@ class EmojiEditor(QWidget):
             self.style_box.blockSignals(False)
         # Снимок вида берём после синхронизации: только реальные правки считаются изменениями
         self._saved_style = self.current_style()
+        # Галочку синхронизируем при каждом показе: запись в реестре могла измениться
+        # извне, пока редактор был закрыт
+        if autostart_supported():
+            self.autostart_box.blockSignals(True)
+            self.autostart_box.setChecked(autostart_enabled())
+            self.autostart_box.blockSignals(False)
         self.show()
+        # Крестик убираем после показа: стиль окна меняется только у готового окна
+        hide_close_button(self)
         self.raise_()
         self.activateWindow()
         self.input.setFocus()
@@ -862,6 +1042,55 @@ class EmojiEditor(QWidget):
             self.hide()
         else:
             super().keyPressEvent(event)
+
+
+class TrayIcon(QObject):
+    """Значок приложения в системном трее.
+
+    Это единственный способ выйти из программы: кнопки «Выход» в редакторе нет,
+    а меню эмодзи вызывается по горячей клавише. Кроме выхода, из значка можно
+    открыть меню смайликов и редактор.
+    """
+
+    show_menu_requested = pyqtSignal()
+    edit_requested = pyqtSignal()
+    exit_requested = pyqtSignal()
+
+    def __init__(self, icon, parent=None):
+        super().__init__(parent)
+        self.tray = QSystemTrayIcon(icon, parent)
+        self.tray.setToolTip("CursorBar — Ctrl+Shift+E открыть меню")
+
+        menu = QMenu()
+        menu.addAction("Открыть меню смайликов").triggered.connect(
+            self.show_menu_requested.emit)
+        menu.addAction("Редактор смайликов").triggered.connect(
+            self.edit_requested.emit)
+        menu.addSeparator()
+        menu.addAction("Выход").triggered.connect(self.exit_requested.emit)
+
+        self.tray.setContextMenu(menu)
+        # Держим ссылку: без неё меню соберёт сборщик мусора и клик правой кнопкой
+        # ничего не покажет
+        self.menu = menu
+
+        # Двойной клик по значку открывает меню смайликов — привычное поведение
+        self.tray.activated.connect(self._on_activated)
+
+    def _on_activated(self, reason):
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            self.show_menu_requested.emit()
+
+    def show(self):
+        self.tray.show()
+
+    def hide(self):
+        self.tray.hide()
+
+    def message(self, title, text):
+        """Всплывающая подсказка от значка."""
+        self.tray.showMessage(title, text, self.tray.icon(), 3000)
+
 
 class RadialMenu(QWidget):
     # --- БЛОК АНИМАЦИИ ---
@@ -1497,6 +1726,10 @@ if __name__ == "__main__":
         sys.exit(0)
 
     app = QApplication(sys.argv)
+    # Приложение живёт в фоне и не должно завершаться от закрытия окна редактора.
+    # По умолчанию Qt выходит, когда закрыто последнее окно, — именно это выкидывало
+    # пользователя из программы, когда он хотел лишь свернуть редактор
+    app.setQuitOnLastWindowClosed(False)
     # Иконка на уровне приложения: она же попадает в панель задач и в список окон
     icon = load_app_icon()
     if icon is not None:
@@ -1524,20 +1757,65 @@ if __name__ == "__main__":
         editor.show_editor(menu.emojis, menu.style)
 
     def quit_app():
+        # Несохранённые правки редактора предлагаем записать: выход из трея
+        # иначе молча потерял бы их
+        if editor.has_unsaved_changes():
+            # Показываем окно перед вопросом: со скрытым родителем диалог мог
+            # появиться в случайном месте или без фокуса. Состояние окна при этом
+            # не трогаем — правки должны остаться на месте
+            editor.show()
+            hide_close_button(editor)
+            editor.raise_()
+            editor.activateWindow()
+            answer = QMessageBox.question(
+                editor,
+                "Выйти из программы?",
+                "В списке смайликов есть несохранённые изменения. "
+                "Сохранить их перед выходом?",
+                QMessageBox.StandardButton.Save |
+                QMessageBox.StandardButton.Discard |
+                QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Save,
+            )
+            if answer == QMessageBox.StandardButton.Save:
+                if not editor.save():
+                    return  # Сохранить не удалось — не выходим, чтобы не потерять правки
+            elif answer == QMessageBox.StandardButton.Discard:
+                editor.hide()
+            else:
+                return  # Отмена или закрытие диалога — остаёмся в программе
+
         # Снимаем хуки до остановки цикла событий: иначе библиотека keyboard
         # останется висеть в процессе
         for hotkey in hotkeys:
             keyboard.remove_hotkey(hotkey)
         hotkeys.clear()
+        tray.hide()
         app.quit()
 
     listener.triggered.connect(menu.show_centered)
     listener.dismissed.connect(menu.hide_menu)
     listener.edit_requested.connect(open_editor)
     editor.saved.connect(menu.set_emojis)
-    editor.exit_requested.connect(quit_app)
     # Вид применяется сразу при выборе в списке
     editor.style_changed.connect(menu.set_style)
+
+    # Значок в трее: из него открывают меню, редактор и выходят из программы
+    tray = TrayIcon(icon if icon is not None else app.windowIcon())
+    tray.show_menu_requested.connect(menu.show_centered)
+    tray.edit_requested.connect(open_editor)
+    tray.exit_requested.connect(quit_app)
+    tray.show()
+
+    # Подсказываем про значок при первом запуске: Windows прячет новые значки
+    # под стрелкой у часов, и без подсказки их просто не находят
+    if not settings.get("tray_hint_shown"):
+        tray.message(
+            "CursorBar работает в фоне",
+            "Значок приложения — в трее у часов (нажмите ^, если его не видно).\n"
+            "Правый клик по значку — открыть меню, редактор или выйти.\n"
+            "Меню смайликов вызывается по Ctrl+Shift+E.")
+        update_settings({"tray_hint_shown": True})
 
     try:
         # Назначаем глобальные горячие клавиши
