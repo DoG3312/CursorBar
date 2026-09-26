@@ -3,6 +3,7 @@ import os
 import math
 import json
 import random
+import shutil
 import ctypes
 
 try:
@@ -71,14 +72,110 @@ def _bundle_dir():
     return getattr(sys, "_MEIPASS", _app_dir())
 
 
-# Данные пользователя храним рядом с программой. Внутри сборки их держать нельзя:
-# временная папка onefile удаляется при выходе и смайлики пропадали бы при перезапуске
+# Данные пользователя храним в «Документах», а не рядом с программой: .exe можно
+# переложить в другое место (или запустить из архива), и настройки со смайликами
+# переживут переезд. Внутри сборки их держать нельзя ещё и потому, что временная
+# папка onefile удаляется при выходе и смайлики пропадали бы при перезапуске
 APP_DIR = _app_dir()
 BUNDLE_DIR = _bundle_dir()
 
-EMOJIS_PATH = os.path.join(APP_DIR, "emojis.json")
-SETTINGS_PATH = os.path.join(APP_DIR, "settings.json")
-BACKGROUND_PATH = os.path.join(APP_DIR, "background.png")
+DATA_FOLDER_NAME = "CursorBar"
+# Папка «Документы» в виде GUID: SHGetKnownFolderPath вернёт её настоящий путь
+FOLDERID_DOCUMENTS = bytes((
+    0xD0, 0x9A, 0xD3, 0xFD, 0x8F, 0x23, 0xAF, 0x46,
+    0xAD, 0xB4, 0x6C, 0x85, 0x48, 0x03, 0x69, 0xC7,
+))
+
+
+def _known_documents_dir():
+    """Путь к папке «Документы» по данным Windows.
+
+    Просто склеить `%USERPROFILE%\\Documents` нельзя: пользователь мог перенести
+    папку в другое место (например, в OneDrive), и тогда данные легли бы в никуда.
+    """
+    if os.name != "nt":
+        return None
+
+    class GUID(ctypes.Structure):
+        _fields_ = [
+            ("data1", ctypes.c_ulong),
+            ("data2", ctypes.c_ushort),
+            ("data3", ctypes.c_ushort),
+            ("data4", ctypes.c_ubyte * 8),
+        ]
+
+    folder_id = GUID.from_buffer_copy(FOLDERID_DOCUMENTS)
+    result = ctypes.c_wchar_p()
+    try:
+        code = ctypes.windll.shell32.SHGetKnownFolderPath(
+            ctypes.byref(folder_id), 0, None, ctypes.byref(result)
+        )
+    except OSError:
+        return None
+    if code != 0 or not result.value:
+        return None
+    path = result.value
+    # Строку выделяет оболочка Windows — освобождать её обязаны мы
+    ctypes.windll.ole32.CoTaskMemFree(result)
+    return path
+
+
+def _documents_dir():
+    """Папка для данных пользователя или None, если определить её не удалось."""
+    base = _known_documents_dir() or os.path.expanduser(os.path.join("~", "Documents"))
+    if not base or not os.path.isdir(base):
+        return None
+    return os.path.join(base, DATA_FOLDER_NAME)
+
+
+def _data_dir():
+    """Где хранить данные. Если «Документы» недоступны, откатываемся к папке программы."""
+    documents = _documents_dir()
+    if documents is None:
+        print("Не удалось найти папку «Документы». Храню данные рядом с программой.")
+        return APP_DIR
+    # Папку создаём сразу: если она уже есть, makedirs просто ничего не сделает
+    try:
+        os.makedirs(documents, exist_ok=True)
+    except OSError as error:
+        print(f"Не удалось создать {documents} ({error}). Храню данные рядом с программой.")
+        return APP_DIR
+    return documents
+
+
+DATA_DIR = _data_dir()
+
+EMOJIS_PATH = os.path.join(DATA_DIR, "emojis.json")
+SETTINGS_PATH = os.path.join(DATA_DIR, "settings.json")
+BACKGROUND_PATH = os.path.join(DATA_DIR, "background.png")
+
+
+def migrate_data_files():
+    """Переносит файлы из старого места (рядом с программой) в папку данных.
+
+    Без этого после обновления настройки и смайлики выглядели бы сброшенными:
+    программа искала бы их в новом месте, не находя старых файлов.
+    """
+    for name in ("emojis.json", "settings.json", "background.png"):
+        old = os.path.join(APP_DIR, name)
+        new = os.path.join(DATA_DIR, name)
+        # Пути совпадают, когда «Документы» недоступны и данные лежат рядом с программой
+        if old == new or not os.path.exists(old):
+            continue
+        if os.path.exists(new):
+            # Файл в папке данных свежее, но старый остался рядом. Молчать нельзя:
+            # правки в нём ни на что не влияли бы. Сам файл не трогаем — это данные пользователя
+            print(f"Внимание: {old} больше не используется, "
+                  f"актуальный файл — {new}")
+            continue
+        try:
+            shutil.move(old, new)
+            print(f"Файл {name} перенесён в {DATA_DIR}")
+        except OSError as error:
+            # Не перенеслось — не беда: дальше файл просто создастся заново
+            print(f"Не удалось перенести {old} ({error}).")
+
+
 # Иконку ищем сначала рядом с программой (свою), затем среди встроенных ресурсов.
 # ICO идёт следом за SVG на случай, если в сборке не оказалось плагина Qt для SVG:
 # без него иконка молча получилась бы пустой и значок в трее был бы невидимым
@@ -92,7 +189,7 @@ ICON_CANDIDATES = (
 DEFAULT_STYLE = "classic"
 
 # Стили колеса: цвета подложки, подсветки и подписей.
-# background — своя картинка пользователя (если файл background.png лежит рядом со скриптом)
+# background — своя картинка пользователя (если файл background.png лежит в папке данных)
 STYLES = {
     "classic": {
         "name": "Классический",
@@ -847,9 +944,11 @@ class EmojiEditor(QWidget):
             "<li>Чем больше смайликов, тем мельче подписи. До 36 они остаются "
             "крупными, после 80 начинают сжиматься.</li>"
             "<li>Своя картинка вместо фона: положите файл "
-            "<b>background.png</b> рядом со скриптом.</li>"
+            "<b>background.png</b> в папку данных.</li>"
             "<li>Смайлики хранятся в <b>emojis.json</b>, вид колеса — в "
-            "<b>settings.json</b> рядом со скриптом.</li>"
+            "<b>settings.json</b> в папке данных.</li>"
+            "<li>Папка данных — <b>Документы\\CursorBar</b>. Она не зависит от того, "
+            "где лежит программа: файл можно перенести, и настройки сохранятся.</li>"
             "<li><b>Запускать вместе с Windows</b> — приложение будет само "
             "стартовать при входе в систему. Снимите галочку, чтобы убрать.</li>"
             "</ul>"
@@ -1439,7 +1538,7 @@ class RadialMenu(QWidget):
         painter.restore()
 
     def _background_pixmap(self):
-        """Своя картинка background.png рядом со скриптом (если пользователь её положил)."""
+        """Своя картинка background.png из папки данных (если пользователь её положил)."""
         if self._background is None and self._background_loaded is False:
             self._background_loaded = True
             if os.path.exists(BACKGROUND_PATH):
@@ -1753,6 +1852,9 @@ if __name__ == "__main__":
     # По умолчанию Qt выходит, когда закрыто последнее окно, — именно это выкидывало
     # пользователя из программы, когда он хотел лишь свернуть редактор
     app.setQuitOnLastWindowClosed(False)
+    # Файлы от прошлых версий лежали рядом с программой: переносим их до чтения,
+    # иначе настройки и смайлики выглядели бы сброшенными
+    migrate_data_files()
     # Иконка на уровне приложения: она же попадает в панель задач и в список окон
     icon = load_app_icon()
     if icon is not None:
