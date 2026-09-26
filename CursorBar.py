@@ -25,7 +25,7 @@ from PyQt6.QtGui import (
 )
 
 # Версия приложения. Держим в одном месте: её печатает --version и под неё ставится тег релиза
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 # Ваши любимые смайлики по умолчанию: используются, если файл настроек ещё не создан
 DEFAULT_EMOJIS = ["ಠ_ಠ", "(￣ー￣ )", "(づ｡◕‿‿◕｡)づ", "(つ≧▽≦)つ", "≽^•⩊•^≼", "(^◕.◕^)", "(⁄ ⁄>⁄ ▽ ⁄<⁄ ⁄)", "(⁄ ⁄>⁄ ⁄ <⁄ ⁄)", "(⸝⸝⸝O﹏O⸝⸝⸝)", "ദ്ദി◝ ⩊ ◜.ᐟ", "(˵ ¬ᴗ¬˵)", "￣へ￣", "=￣ω￣=", "(─‿‿─)", "(=⌒‿‿⌒=)"]
@@ -266,9 +266,6 @@ def _paw_path(scale):
     for dx, dy, r in ((-1.08, -0.56, 0.32), (-0.40, -1.00, 0.33), (0.40, -1.00, 0.33), (1.08, -0.56, 0.32)):
         path.addEllipse(QPointF(dx * scale, dy * scale), r * scale, r * scale)
     return path
-
-
-
 
 
 def ring_bounds_for(radius, rings, ring):
@@ -554,10 +551,10 @@ class EmojiEditor(QWidget):
         exit_button.clicked.connect(self.request_exit)
 
         bottom_row = QHBoxLayout()
+        bottom_row.addWidget(save_button)
+        bottom_row.addStretch(1)
         bottom_row.addWidget(info_button)
         bottom_row.addWidget(exit_button)
-        bottom_row.addStretch(1)
-        bottom_row.addWidget(save_button)
 
         # Разделители отделяют список от настроек и кнопок
         self.divider_top = QFrame()
@@ -1160,6 +1157,12 @@ class RadialMenu(QWidget):
         inner, outer = self.inner_radius, self.radius
         center_x, center_y = self.width() / 2, self.height() / 2
 
+        painter.save()
+        # Обрезаем по полосам колец. Пустая середина и зазоры между кольцами ничем
+        # не залиты, поэтому фигура, попавшая туда, висела бы прямо на прозрачном
+        # фоне — как звёзды в дырке по центру
+        painter.setClipPath(self._paint_cache()["ring_path"])
+
         for kind, x, y, size, alpha, rotation in self._paint_cache()["decorations"]:
             distance = math.hypot(x - center_x, y - center_y)
             in_ring = inner <= distance <= outer
@@ -1188,6 +1191,8 @@ class RadialMenu(QWidget):
                 painter.drawPath(_paw_path(size / 2.2))
 
             painter.restore()
+
+        painter.restore()
 
     def _background_pixmap(self):
         """Своя картинка background.png рядом со скриптом (если пользователь её положил)."""
@@ -1302,60 +1307,69 @@ class RadialMenu(QWidget):
         # Фиксированный seed: узор не должен прыгать при каждой перерисовке
         rng = random.Random(20260926)
         items = []
-        inner = self.inner_radius
+
+        # Пустая середина и зазоры между кольцами ничем не залиты: фигура, попавшая
+        # туда, висела бы прямо на прозрачном фоне — как звёзды в дырке по центру.
+        # Поэтому декор кладём только в полосы самих колец и с отступом на свой размер
+        bands = [self.ring_bounds(ring) for ring in range(self.ring_count)]
+
+        def spot(size, band=None):
+            """Точка внутри полосы кольца: фигура целиком влезает в полосу."""
+            band_inner, band_outer = band if band else bands[rng.randrange(len(bands))]
+            low, high = band_inner + size, band_outer - size
+            if low >= high:
+                # Кольцо уже самой фигуры: ставим её по центру полосы
+                low = high = (band_inner + band_outer) / 2
+            radius = rng.uniform(low, high)
+            angle = rng.uniform(0, 2 * math.pi)
+            return (center_x + math.cos(angle) * radius,
+                    center_y + math.sin(angle) * radius)
 
         if kind == "stars":
             # Звёзды двух видов: мелкая пыль по кольцу и несколько крупных
             for _ in range(70):
-                angle = rng.uniform(0, 2 * math.pi)
-                radius = rng.uniform(inner * 0.35, self.radius * 0.97)
                 size = rng.uniform(2.0, 5.0)
-                alpha = rng.randint(70, 190)
-                items.append(("star", center_x + math.cos(angle) * radius,
-                              center_y + math.sin(angle) * radius, size, alpha,
-                              rng.uniform(0, 72)))
+                x, y = spot(size)
+                items.append(("star", x, y, size, rng.randint(70, 190), rng.uniform(0, 72)))
             for _ in range(6):
-                angle = rng.uniform(0, 2 * math.pi)
-                radius = rng.uniform(inner * 1.5, self.radius * 0.9)
                 size = rng.uniform(7.0, 12.0)
-                alpha = rng.randint(180, 240)
-                items.append(("star", center_x + math.cos(angle) * radius,
-                              center_y + math.sin(angle) * radius, size, alpha,
-                              rng.uniform(0, 40)))
+                x, y = spot(size)
+                items.append(("star", x, y, size, rng.randint(180, 240), rng.uniform(0, 40)))
         elif kind == "paws":
-            ring_width = self.radius - inner
-
-            # Лапки-следы идут по кругу между секторами, как цепочка следов
+            # Лапки-следы идут по кругу между секторами, как цепочка следов.
+            # Кольца чередуем, иначе на нескольких кольцах следы сбивались бы в одно
             step = 360 / max(1, len(self.emojis))
             for i in range(len(self.emojis)):
+                band_inner, band_outer = bands[i % len(bands)]
+                radius = (band_inner + band_outer) / 2
+                size = max(7.0, (band_outer - band_inner) * 0.062)
                 angle = math.radians(i * step + step / 2)
-                radius = inner + ring_width * 0.5
-                size = max(7.0, ring_width * 0.062)
                 # Чередуем наклон и объём, чтобы следы не выглядели штампом
                 tilt = 14 if i % 2 == 0 else -14
                 items.append(("paw", center_x + math.cos(angle) * radius,
                               center_y + math.sin(angle) * radius, size, 105, tilt))
 
-            # Сердечки и искорки рассыпаны по полосе кольца
+            # Сердечки и искорки рассыпаны по полосам колец
             for _ in range(16):
-                angle = rng.uniform(0, 2 * math.pi)
-                radius = rng.uniform(inner * 1.02, self.radius * 0.94)
                 size = rng.uniform(4.0, 9.0)
-                items.append(("heart", center_x + math.cos(angle) * radius,
-                              center_y + math.sin(angle) * radius, size,
-                              rng.randint(70, 150), rng.uniform(-22, 22)))
+                x, y = spot(size)
+                items.append(("heart", x, y, size, rng.randint(70, 150),
+                              rng.uniform(-22, 22)))
             for _ in range(14):
-                angle = rng.uniform(0, 2 * math.pi)
-                radius = rng.uniform(inner * 1.02, self.radius * 0.95)
                 size = rng.uniform(3.5, 7.0)
-                items.append(("sparkle", center_x + math.cos(angle) * radius,
-                              center_y + math.sin(angle) * radius, size,
-                              rng.randint(110, 210), rng.uniform(-15, 15)))
+                x, y = spot(size)
+                items.append(("sparkle", x, y, size, rng.randint(110, 210),
+                              rng.uniform(-15, 15)))
 
-            # Лапки, будто кто-то оставил следы у внутреннего края кольца
-            for dx in (-0.60, 0.60):
-                items.append(("paw", center_x + dx * inner, center_y - inner * 0.60,
-                              max(4.5, inner * 0.11), 170, -dx * 12))
+            # Две лапки у внутреннего края самого узкого кольца
+            band_inner, band_outer = bands[-1]
+            paw_size = max(4.5, (band_outer - band_inner) * 0.075)
+            radius = band_inner + paw_size
+            for sign in (-1, 1):
+                angle = math.radians(-90 + sign * 24)
+                items.append(("paw", center_x + math.cos(angle) * radius,
+                              center_y + math.sin(angle) * radius,
+                              paw_size, 170, sign * 12))
         return items
 
     def _paint_cache(self):
