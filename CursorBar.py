@@ -3,6 +3,7 @@ import os
 import math
 import json
 import random
+import ctypes
 
 try:
     import keyboard
@@ -22,6 +23,9 @@ from PyQt6.QtGui import (
     QPainter, QColor, QFont, QFontMetricsF, QPainterPath, QCursor, QGuiApplication,
     QBrush, QPen, QPixmap, QRadialGradient, QIcon, QDrag,
 )
+
+# Версия приложения. Держим в одном месте: её печатает --version и под неё ставится тег релиза
+__version__ = "1.0.0"
 
 # Ваши любимые смайлики по умолчанию: используются, если файл настроек ещё не создан
 DEFAULT_EMOJIS = ["ಠ_ಠ", "(￣ー￣ )", "(づ｡◕‿‿◕｡)づ", "(つ≧▽≦)つ", "≽^•⩊•^≼", "(^◕.◕^)", "(⁄ ⁄>⁄ ▽ ⁄<⁄ ⁄)", "(⁄ ⁄>⁄ ⁄ <⁄ ⁄)", "(⸝⸝⸝O﹏O⸝⸝⸝)", "ദ്ദി◝ ⩊ ◜.ᐟ", "(˵ ¬ᴗ¬˵)", "￣へ￣", "=￣ω￣=", "(─‿‿─)", "(=⌒‿‿⌒=)"]
@@ -1425,7 +1429,59 @@ class RadialMenu(QWidget):
             pass
 
 
+def _ensure_output_stream():
+    """Готовит поток вывода: рабочий оставляем, отсутствующий берём у консоли родителя.
+
+    Оконная сборка своей консоли не имеет, поэтому print() уходит в никуда. Но если
+    вывод уже перенаправлен в файл или канал, подменять его нельзя — иначе результат
+    уйдёт в консоль, а перенаправление окажется пустым.
+    """
+    if sys.stdout is not None:
+        try:
+            sys.stdout.write("")
+            sys.stdout.flush()
+            return
+        except (OSError, ValueError, AttributeError):
+            pass
+
+    if os.name == "nt" and getattr(sys, "frozen", False):
+        try:
+            ctypes.windll.kernel32.AttachConsole(-1)  # -1 = консоль родителя
+            stream = open("CONOUT$", "w", encoding="utf-8", buffering=1)
+            sys.stdout = stream
+            sys.stderr = stream
+        except OSError:
+            pass
+
+
+def show_version_if_asked():
+    """Обрабатывает --version и --help до запуска Qt: без окна и без хуков клавиатуры."""
+    if len(sys.argv) < 2 or sys.argv[1] not in ("--version", "-V", "--help", "-h"):
+        return False
+
+    _ensure_output_stream()
+
+    if sys.stdout is None:
+        # Ни консоли, ни перенаправления: сказать версию некуда, но и падать незачем
+        return True
+
+    if sys.argv[1] in ("--version", "-V"):
+        print(f"CursorBar {__version__}")
+    else:
+        print(f"CursorBar {__version__}")
+        print("Радиальное меню эмодзи для Windows.\n")
+        print("Горячие клавиши:")
+        print("  Ctrl+Shift+E — открыть меню")
+        print("  Ctrl+Shift+R — открыть редактор смайликов")
+        print("  Esc          — закрыть меню")
+    sys.stdout.flush()
+    return True
+
+
 if __name__ == "__main__":
+    if show_version_if_asked():
+        sys.exit(0)
+
     app = QApplication(sys.argv)
     # Иконка на уровне приложения: она же попадает в панель задач и в список окон
     icon = load_app_icon()

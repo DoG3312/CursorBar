@@ -27,7 +27,25 @@
 Внутри редактора: двойной клик — изменить строку, `Delete` — удалить, `Ctrl+D` —
 дублировать, `Ctrl+↑` / `Ctrl+↓` — поменять порядок.
 
-## Установка
+## Скачать готовую сборку
+
+Python не нужен — скачайте готовый файл со страницы
+[Releases](https://github.com/DoG3312/CursorBar/releases). Есть два варианта:
+
+| Файл | Скачивание | На диске | Запуск |
+| --- | --- | --- | --- |
+| `CursorBar-1.0.0-windows-x64.exe` | 35,6 МБ | 35,6 МБ, один файл | ~1 сек |
+| `CursorBar-1.0.0-windows-x64-folder.zip` | 35,6 МБ | 91 МБ, 189 файлов | ~0,3 сек |
+
+**Проще всего** — один `.exe`: скачали и запустили, ничего распаковывать не нужно.
+Сборка папкой стартует чуть быстрее и меньше ест памяти (64 МБ против 71 МБ), но после
+распаковки занимает 91 МБ — при переносе копировать папку нужно целиком, `CursorBar.exe`
+без `_internal` не запустится.
+
+Первый запуск создаёт рядом с программой `emojis.json` и `settings.json` — ваши смайлики и
+вид колеса.
+
+## Установка из исходников
 
 Нужен Python 3.10 или новее.
 
@@ -36,20 +54,16 @@ pip install -r requirements.txt
 python CursorBar.py
 ```
 
-Готовую сборку можно сделать самостоятельно — см. раздел «Сборка .exe». Папку нужно
-переносить целиком, `CursorBar.exe` без `_internal` не запустится.
-
 ## Сборка .exe
 
 ```powershell
 pip install pyinstaller
-pyinstaller --noconfirm --clean --windowed --name CursorBar `
-  --icon CursorBar.ico --add-data "CursorBar.svg;." `
-  --hidden-import keyboard --hidden-import pyperclip CursorBar.py
+pyinstaller --noconfirm --clean CursorBar.spec
 ```
 
-Результат появится в `dist/CursorBar/`. Это сборка папкой: ресурсы лежат в `_internal`,
-рядом с `.exe` создаются ваши `emojis.json` и `settings.json`.
+Готовый `CursorBar.spec` уже описывает иконку, встроенный SVG и скрытые зависимости,
+поэтому результат появится в `dist/CursorBar/` — это сборка папкой, ресурсы лежат в
+`_internal`. Чтобы получить один файл, добавьте к команде `--onefile`.
 
 ## Структура проекта
 
@@ -59,6 +73,13 @@ pyinstaller --noconfirm --clean --windowed --name CursorBar `
 | `CursorBar.svg` | Иконка приложения |
 | `CursorBar.ico` | Иконка для `.exe`, 7 размеров (16–256) |
 | `CursorBar.spec` | Готовый сценарий сборки для PyInstaller |
+
+## Проверка версии
+
+```powershell
+CursorBar.exe --version   # CursorBar 1.0.0
+CursorBar.exe --help      # краткая справка по горячим клавишам
+```
 
 ## Как это работает
 

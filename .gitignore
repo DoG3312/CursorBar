@@ -1,6 +1,9 @@
 # Готовые сборки: 91 МБ на каждую, в репозитории не нужны
 dist/
 build/
+dist_onefile/
+build_onefile/
+release/
 
 # Виртуальные окружения
 .venv/
