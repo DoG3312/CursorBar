@@ -1,0 +1,23 @@
+# Готовые сборки: 91 МБ на каждую, в репозитории не нужны
+dist/
+build/
+
+# Виртуальные окружения
+.venv/
+venv/
+
+# Кэш Python
+__pycache__/
+*.py[cod]
+
+# Артефакты PyInstaller: пересобираются из CursorBar.spec
+*.manifest
+
+# Пользовательские данные: у каждого свой набор смайликов и вид колеса
+emojis.json
+settings.json
+background.png
+
+# Настройки редактора
+.vscode/
+.idea/
