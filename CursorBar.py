@@ -32,7 +32,7 @@ from PyQt6.QtGui import (
 )
 
 # Версия приложения. Держим в одном месте: её печатает --version и под неё ставится тег релиза
-__version__ = "1.0.2"
+__version__ = "1.0.3"
 
 # Ваши любимые смайлики по умолчанию: используются, если файл настроек ещё не создан
 DEFAULT_EMOJIS = ["ಠ_ಠ", "(￣ー￣ )", "(づ｡◕‿‿◕｡)づ", "(つ≧▽≦)つ", "≽^•⩊•^≼", "(^◕.◕^)", "(⁄ ⁄>⁄ ▽ ⁄<⁄ ⁄)", "(⁄ ⁄>⁄ ⁄ <⁄ ⁄)", "(⸝⸝⸝O﹏O⸝⸝⸝)", "ദ്ദി◝ ⩊ ◜.ᐟ", "(˵ ¬ᴗ¬˵)", "￣へ￣", "=￣ω￣=", "(─‿‿─)", "(=⌒‿‿⌒=)"]
@@ -151,7 +151,7 @@ def load_settings(path=SETTINGS_PATH):
 
     Незнакомые ключи сохраняем: их пишут другие части программы, и терять их нельзя.
     """
-    settings = {"style": DEFAULT_STYLE, "tray_hint_shown": False}
+    settings = {"style": DEFAULT_STYLE}
     data, error = read_json_file(path)
     if error:
         print(f"Не удалось прочитать {path} ({error}). Использую настройки по умолчанию.")
@@ -199,14 +199,33 @@ def update_settings(updates, path=SETTINGS_PATH):
     return save_settings(data, path)
 
 
-def reset_setting(key, path=SETTINGS_PATH):
-    """Убирает ключ из настроек: при следующем чтении вернётся значение по умолчанию."""
-    loaded, error = read_json_file(path)
-    if error or not isinstance(loaded, dict):
-        return
-    if key in loaded:
-        del loaded[key]
-        save_settings(loaded, path)
+def claim_single_instance(name="CursorBar_DoG3312_SingleInstance"):
+    """Не даёт запустить второе окно приложения.
+
+    Каждый запуск добавлял свой значок в трей, и вместо одного значка их
+    становилось несколько, а хоткеи конфликтовали между собой.
+
+    Возвращает мьютекс, который нужно держать до выхода из программы.
+    None означает, что приложение уже запущено.
+    """
+    if os.name != "nt":
+        return True  # На других системах проверку не делаем
+    ERROR_ALREADY_EXISTS = 183
+    try:
+        # use_last_error обязателен: обычный GetLastError может быть перебит
+        # вызовами, которые ctypes делает после самой функции
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        handle = kernel32.CreateMutexW(None, False, name)
+        if not handle:
+            return True  # Не смогли создать — не мешаем запуску
+        if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+            kernel32.CloseHandle(ctypes.c_void_p(handle))
+            return None
+        # Дескриптор держим до конца работы: закрытие освободит мьютекс
+        return handle
+    except (AttributeError, OSError):
+        return True
 
 
 def hide_close_button(widget):
@@ -1087,10 +1106,6 @@ class TrayIcon(QObject):
     def hide(self):
         self.tray.hide()
 
-    def message(self, title, text):
-        """Всплывающая подсказка от значка."""
-        self.tray.showMessage(title, text, self.tray.icon(), 3000)
-
 
 class RadialMenu(QWidget):
     # --- БЛОК АНИМАЦИИ ---
@@ -1725,6 +1740,14 @@ if __name__ == "__main__":
     if show_version_if_asked():
         sys.exit(0)
 
+    # Второй запуск только добавил бы ещё один значок в трей и перебил хоткеи
+    instance = claim_single_instance()
+    if instance is None:
+        print("CursorBar уже запущен. Второй значок не нужен: "
+              "закройте лишний через правый клик по нему → «Выход».")
+        # Молча выходим: оконная сборка не покажет сообщение без консоли
+        sys.exit(0)
+
     app = QApplication(sys.argv)
     # Приложение живёт в фоне и не должно завершаться от закрытия окна редактора.
     # По умолчанию Qt выходит, когда закрыто последнее окно, — именно это выкидывало
@@ -1806,16 +1829,6 @@ if __name__ == "__main__":
     tray.edit_requested.connect(open_editor)
     tray.exit_requested.connect(quit_app)
     tray.show()
-
-    # Подсказываем про значок при первом запуске: Windows прячет новые значки
-    # под стрелкой у часов, и без подсказки их просто не находят
-    if not settings.get("tray_hint_shown"):
-        tray.message(
-            "CursorBar работает в фоне",
-            "Значок приложения — в трее у часов (нажмите ^, если его не видно).\n"
-            "Правый клик по значку — открыть меню, редактор или выйти.\n"
-            "Меню смайликов вызывается по Ctrl+Shift+E.")
-        update_settings({"tray_hint_shown": True})
 
     try:
         # Назначаем глобальные горячие клавиши
